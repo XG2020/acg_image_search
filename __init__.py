@@ -12,7 +12,7 @@ plugin = NekroPlugin(
     module_name="acg_image_search",
     description="提供二次元图片搜索功能",
     version="1.0.0",
-    author="XG.GM, Zaxpris, wess09",
+    author="XG.GM",
     url="https://github.com/XG2020/acg_image_search",
 )
 
