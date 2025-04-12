@@ -181,7 +181,7 @@ async def acg_image_search(_ctx: AgentCtx, tags: List[str]) -> bytes:
             last_error = f"图片数据解析错误: {str(e)}"
             logger.error(last_error)
         except Exception as e:
-            last_error = f"图片搜索未知错误: {str(e)}".encode()
+            last_error = f"图片搜索未知错误: {str(e)}"
 
 @plugin.mount_cleanup_method()
 async def clean_up():
