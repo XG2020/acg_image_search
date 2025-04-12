@@ -1,5 +1,5 @@
 import httpx
-from typing import List
+from typing import List, Optional
 from pydantic import BaseModel, Field
 
 from nekro_agent.services.plugin.base import NekroPlugin, ConfigBase, SandboxMethodType
@@ -11,7 +11,7 @@ plugin = NekroPlugin(
     name="ACG图片搜索插件",
     module_name="acg_image_search",
     description="提供二次元图片搜索功能",
-    version="1.0.0",
+    version="1.1.0",  # 版本号更新
     author="XGGM",
     url="https://github.com/XG2020/acg_image_search",
 )
@@ -30,7 +30,7 @@ class AcgImageConfig(ConfigBase):
         description="是否允许R18内容",
     )
     TIMEOUT: float = Field(
-        default=10.0,
+        default=30.0,
         title="请求超时时间",
         description="API请求的超时时间(秒)",
     )
@@ -39,18 +39,23 @@ class AcgImageConfig(ConfigBase):
         title="最大标签数",
         description="允许的最大搜索标签数量",
     )
+    MAX_RETRIES: int = Field(
+        default=3,
+        title="最大重试次数",
+        description="当搜索结果为空时的最大重试次数",
+    )
 
 # 获取配置
 config = plugin.get_config(AcgImageConfig)
 
-async def fetch_image_data(tags: List[str]) -> str:
+async def fetch_image_data(tags: List[str]) -> Optional[str]:
     """获取图片URL数据
     
     Args:
         tags: 搜索标签列表
         
     Returns:
-        str: 图片URL或错误消息
+        str: 图片URL，如果找不到图片则返回None
         
     Raises:
         httpx.RequestError: 请求失败时抛出
@@ -68,16 +73,21 @@ async def fetch_image_data(tags: List[str]) -> str:
         response = await client.post(config.API_URL, json=params)
         response.raise_for_status()
         data = response.json()
+        
+        # 检查是否有返回数据
+        if not data.get("data") or not data["data"]:
+            return None
+            
         return data["data"][0]["urls"]["original"]
 
-async def download_image(url: str) -> bytes:
-    """下载图片数据
+async def download_image(url: str) -> Optional[bytes]:
+    """下载图片数据并验证内容
     
     Args:
         url: 图片URL
         
     Returns:
-        bytes: 图片字节流
+        bytes: 图片字节流，如果下载失败或内容为空则返回None
         
     Raises:
         httpx.RequestError: 请求失败时抛出
@@ -86,24 +96,46 @@ async def download_image(url: str) -> bytes:
     async with httpx.AsyncClient(timeout=config.TIMEOUT) as client:
         response = await client.get(url)
         response.raise_for_status()
+        
+        # 验证图片内容是否有效
+        if not response.content or len(response.content) < 1024:  # 假设小于1KB为无效图片
+            return None
+        
         return response.content
+
+def adjust_tags(tags: List[str], attempt: int) -> List[str]:
+    """根据重试次数调整标签列表
+    
+    Args:
+        tags: 原始标签列表
+        attempt: 当前重试次数
+        
+    Returns:
+        List[str]: 调整后的标签列表
+    """
+    if len(tags) <= 1:
+        return tags
+        
+    # 根据重试次数移除部分标签
+    return tags[:max(1, len(tags) - attempt)]
 
 @plugin.mount_sandbox_method(
     SandboxMethodType.TOOL,
     name="acg_image_search",
-    description="二次元图片搜索，获取图片字节流",
+    description="二次元图片搜索，获取图片字节流。当结果为空时会自动调整标签重试",
 )
 async def acg_image_search(_ctx: AgentCtx, tags: List[str]) -> bytes:
     """二次元图片搜索
     
     根据提供的标签列表搜索并返回图片字节流，仅返回.jpg格式图片。
     最多支持3个标签同时搜索。
+    当搜索结果为空时，会自动尝试调整标签组合进行多次搜索。
     
     Args:
         tags: 搜索标签列表，最多3个标签
         
     Returns:
-        bytes: 图片字节流
+        bytes: 图片字节流。如果最终找不到有效图片则返回错误消息的字节流
         
     Raises:
         ValueError: 如果标签数量超过限制或为空
@@ -118,28 +150,38 @@ async def acg_image_search(_ctx: AgentCtx, tags: List[str]) -> bytes:
         raise ValueError(f"最多支持{config.MAX_TAGS}个标签同时搜索")
         
     clean_tags = [t.strip() for t in tags if t.strip()]
+    last_error = ""
     
-    try:
-        # 获取图片URL
-        image_url = await fetch_image_data(clean_tags)
-        
-        # 下载图片
-        if image_url.startswith("http"):
-            return await download_image(image_url)
-        return image_url.encode()
-        
-    except httpx.RequestError as e:
-        logger.error(f"图片搜索请求失败: {e}")
-        return f"图片搜索失败，无法连接到服务: {str(e)}".encode()
-    except httpx.HTTPStatusError as e:
-        logger.error(f"图片搜索HTTP错误: {e}")
-        return f"图片搜索失败，服务返回错误: {e.response.status_code}".encode()
-    except KeyError as e:
-        logger.error(f"图片数据解析错误: {e}")
-        return "图片搜索结果格式不正确".encode()
-    except Exception as e:
-        logger.error(f"图片搜索未知错误: {e}")
-        return f"图片搜索发生未知错误: {str(e)}".encode()
+    for attempt in range(config.MAX_RETRIES + 1):
+        current_tags = adjust_tags(clean_tags, attempt)
+        try:
+            # 获取图片URL
+            image_url = await fetch_image_data(current_tags)
+            
+            if not image_url:
+                logger.info(f"未找到匹配图片，尝试 {attempt+1}/{config.MAX_RETRIES}，标签: {current_tags}")
+                continue
+                
+            # 下载图片
+            image_data = await download_image(image_url) if image_url.startswith("http") else image_url.encode()
+            
+            if not image_data:
+                logger.info(f"下载的图片数据为空，尝试 {attempt+1}/{config.MAX_RETRIES}，标签: {current_tags}")
+                continue
+                
+            return image_data
+            
+        except httpx.RequestError as e:
+            last_error = f"图片搜索请求失败: {str(e)}"
+            logger.error(last_error)
+        except httpx.HTTPStatusError as e:
+            last_error = f"图片搜索HTTP错误: {e.response.status_code}"
+            logger.error(last_error)
+        except KeyError as e:
+            last_error = f"图片数据解析错误: {str(e)}"
+            logger.error(last_error)
+        except Exception as e:
+            last_error = f"图片搜索未知错误: {str(e)}".encode()
 
 @plugin.mount_cleanup_method()
 async def clean_up():
